@@ -1,0 +1,320 @@
+name: Build Alpine Cloud Image
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      boot_mode:
+        description: '引导方式：both = BIOS+UEFI 通用（默认），bios / uefi = 单一模式。阿里云导入时「启动模式」需与之一致。'
+        type: choice
+        options:
+          - both
+          - bios
+          - uefi
+        default: both
+      ssh_pubkey:
+        description: '注入镜像的 SSH 公钥（root 与 alpine 用户都会写入）。填 none 则本次构建不注入任何公钥。'
+        required: false
+        default: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMvW/cDO0A5pLlIC0WD4jr586MYoxhcXvpvVX3evkOJv alpine'
+      password:
+        description: '同时为 root 与 alpine 用户设置的登录密码，留空则不设置任何密码。'
+        required: false
+        default: ''
+      release_tag:
+        description: '要创建或更新的 Release tag，留空则使用 manual-<run number>'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  LIBGUESTFS_BACKEND: direct
+
+concurrency:
+  group: build-alpine-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      # 这个兜底值必须与 workflow_dispatch 里 ssh_pubkey 的 default 保持一致：
+      # 手动触发时走输入值，tag 触发时没有输入值，走这里。
+      SSH_PUBKEY: ${{ inputs.ssh_pubkey || 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMvW/cDO0A5pLlIC0WD4jr586MYoxhcXvpvVX3evkOJv alpine' }}
+      # 留空表示不设置密码；tag 触发时没有输入值，同样不设置密码。
+      SSH_PASSWORD: ${{ inputs.password }}
+      # 引导方式；tag 触发时没有输入值，默认 both。
+      BOOT_MODE: ${{ inputs.boot_mode || 'both' }}
+    outputs:
+      image_version: ${{ steps.download.outputs.image_version }}
+      boot_label: ${{ steps.download.outputs.boot_label }}
+      image_name: ${{ steps.rename.outputs.image_name }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euxo pipefail
+
+          case "${BOOT_MODE}" in
+            both|bios|uefi) ;;
+            *) echo "错误：boot_mode 只能是 both / bios / uefi，当前为 ${BOOT_MODE}"; exit 1 ;;
+          esac
+          echo "引导方式：${BOOT_MODE}"
+
+          if [ "$(printf '%s' "${SSH_PUBKEY}" | tr '[:upper:]' '[:lower:]')" = "none" ]; then
+            echo "ssh_pubkey=none：本次构建不注入任何公钥"
+          else
+            if [ "$(printf '%s' "${SSH_PUBKEY}" | wc -l)" -ne 0 ]; then
+              echo "错误：SSH 公钥不能包含换行符"
+              exit 1
+            fi
+
+            if ! printf '%s' "${SSH_PUBKEY}" | grep -qE '^(ssh-rsa|ssh-dss|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}( [^[:space:]]+)?$'; then
+              echo "错误：SSH_PUBKEY 不是有效的 OpenSSH 公钥：${SSH_PUBKEY}"
+              exit 1
+            fi
+
+            echo "将注入的公钥：${SSH_PUBKEY}"
+          fi
+
+          if [ -z "${SSH_PASSWORD}" ]; then
+            echo "未设置密码：root 与 alpine 保持无密码状态"
+          else
+            if [ "$(printf '%s' "${SSH_PASSWORD}" | wc -l)" -ne 0 ]; then
+              echo "错误：密码不能包含换行符"
+              exit 1
+            fi
+
+            echo "::add-mask::${SSH_PASSWORD}"
+            echo "将为 root 与 alpine 设置同一个登录密码"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libguestfs-tools axel qemu-utils
+
+      - name: Download latest Alpine cloud image
+        id: download
+        run: |
+          set -euxo pipefail
+          BASE_URL="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/cloud"
+
+          # both 模式从 UEFI(GPT) 镜像出发再补 BIOS 引导；反过来在 MBR 镜像上加 UEFI 不可靠。
+          case "${BOOT_MODE}" in
+            bios) BASE_FLAVOR=bios ;;
+            *)    BASE_FLAVOR=uefi ;;
+          esac
+          echo "基础镜像变体：${BASE_FLAVOR}"
+
+          FILE_NAME="$(curl -fsSL "${BASE_URL}/" \
+            | grep -Eo "generic_alpine-[0-9]+\.[0-9]+\.[0-9]+-x86_64-${BASE_FLAVOR}-cloudinit-r[0-9]+\.qcow2" \
+            | sort -Vu \
+            | tail -n1)"
+
+          test -n "${FILE_NAME}" || (echo "未找到可用 qcow2 文件（flavor=${BASE_FLAVOR}）" && exit 1)
+
+          DOWNLOAD_URL="${BASE_URL}/${FILE_NAME}"
+          echo "最新镜像: ${FILE_NAME}"
+          echo "下载地址: ${DOWNLOAD_URL}"
+
+          axel -n 8 -o alpine-base.qcow2 "${DOWNLOAD_URL}"
+
+          IMAGE_VERSION="$(printf '%s' "${FILE_NAME}" | sed -E 's/^generic_alpine-([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+          case "${BOOT_MODE}" in
+            both) BOOT_LABEL=bios-uefi ;;
+            *)    BOOT_LABEL="${BOOT_MODE}" ;;
+          esac
+          echo "image_version=${IMAGE_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "boot_label=${BOOT_LABEL}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify downloaded image
+        run: |
+          set -euxo pipefail
+          echo "--- file 输出 ---"
+          file alpine-base.qcow2
+
+          test -f alpine-base.qcow2 || (echo "错误：alpine-base.qcow2 不存在"; exit 1)
+          test -s alpine-base.qcow2 || (echo "错误：alpine-base.qcow2 为空"; exit 1)
+
+          qemu-img info alpine-base.qcow2 > qemu-img-info.txt 2>&1
+          if grep -q "file format: qcow2" qemu-img-info.txt && grep -q "virtual size" qemu-img-info.txt; then
+            echo "文件类型验证通过：有效 QCOW2 镜像"
+            cat qemu-img-info.txt
+          else
+            echo "错误：qemu-img 无法识别为有效 qcow2"
+            cat qemu-img-info.txt
+            exit 1
+          fi
+
+      - name: Expand qcow2 container
+        run: |
+          set -euxo pipefail
+          sudo qemu-img resize alpine-base.qcow2 1G
+          qemu-img info alpine-base.qcow2
+
+      - name: Customize Alpine image for Alibaba Cloud
+        run: |
+          set -euxo pipefail
+          export LIBGUESTFS_DEBUG=1
+          export LIBGUESTFS_TRACE=1
+
+          SSH_INJECT_ARGS=()
+          if [ "$(printf '%s' "${SSH_PUBKEY}" | tr '[:upper:]' '[:lower:]')" = "none" ]; then
+            echo "ssh_pubkey=none：跳过 SSH 公钥注入"
+          else
+            SSH_INJECT_ARGS=(--ssh-inject "alpine:string:${SSH_PUBKEY}" --ssh-inject "root:string:${SSH_PUBKEY}")
+          fi
+
+          PW_ARGS=()
+          if [ -n "${SSH_PASSWORD}" ]; then
+            printf '%s' "${SSH_PASSWORD}" > "${RUNNER_TEMP}/guest-password"
+            chmod 600 "${RUNNER_TEMP}/guest-password"
+            PW_ARGS=(--password "root:file:${RUNNER_TEMP}/guest-password" --password "alpine:file:${RUNNER_TEMP}/guest-password")
+          else
+            echo "未设置密码：跳过 root 与 alpine 密码设置"
+          fi
+
+          sudo virt-customize -a alpine-base.qcow2 \
+            --smp 2 \
+            --timezone Asia/Hong_Kong \
+            --install sudo,chrony,cloud-init,cloud-utils-growpart \
+            --run-command "mkdir -p /etc/cloud/cloud.cfg.d && printf '%s\n' \
+              'growpart:' \
+              '  mode: auto' \
+              '  devices: [\"/\"]' \
+              '  ignore_growroot_disabled: false' \
+              'resize_rootfs: true' \
+              > /etc/cloud/cloud.cfg.d/99-growpart.cfg" \
+            --run-command "printf '%s\n' \
+              'pool ntp.aliyun.com iburst' \
+              'driftfile /var/lib/chrony/drift' \
+              'rtcsync' \
+              'makestep 1.0 3' \
+              'logdir /var/log/chrony' \
+              > /etc/chrony/chrony.conf" \
+            --run-command "sed -i 's/#*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config" \
+            --run-command "sed -i 's/#*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config" \
+            --run-command "sed -i 's/#*PermitEmptyPasswords.*/PermitEmptyPasswords no/g' /etc/ssh/sshd_config" \
+            --append-line '/etc/ssh/sshd_config:UseDNS no' \
+            "${SSH_INJECT_ARGS[@]}" \
+            "${PW_ARGS[@]}" \
+            --run-command "mkdir -p /etc/cloud/cloud.cfg.d && printf '%s\n' 'disable_root: false' 'ssh_pwauth: true' 'system_info:' '  default_user:' '    name: alpine' '    lock_passwd: false' > /etc/cloud/cloud.cfg.d/99-custom.cfg" \
+            --run-command "if [ -f /boot/extlinux.conf ]; then sed -i 's/\(APPEND .*\)/\1 net.ifnames=0 console=tty0 console=ttyS0,115200n8/' /boot/extlinux.conf; else echo 'skip: /boot/extlinux.conf not found'; fi" \
+            --run-command 'rc-update add chronyd default || true' \
+            --run-command 'rc-update add cloud-init default || true' \
+            --run-command 'rc-update add cloud-config default || true' \
+            --run-command 'rc-update add cloud-final default || true' \
+            --run-command 'rc-update add cloud-init-local default || true' \
+            --run-command 'apk cache clean' \
+            --run-command "cp -f /etc/apk/repositories /etc/apk/repositories.bak" \
+            --run-command "sed -Ei 's#https?://dl-cdn\.alpinelinux\.org/alpine#https://mirrors.aliyun.com/alpine#g' /etc/apk/repositories && echo '--- /etc/apk/repositories ---' && cat /etc/apk/repositories" \
+            --delete '/var/log/*.log' \
+            --delete '/var/cache/apk/*' \
+            --run-command 'mkdir -p /etc && : > /etc/machine-id'
+
+          rm -f "${RUNNER_TEMP}/guest-password"
+
+      # both 模式：基础镜像是 UEFI(GPT) 的，这里在磁盘尾部空闲空间补一个 bios_grub 分区，
+      # 并把 GRUB 的 BIOS 引导（i386-pc）写进去。UEFI 那条路完全不动，两边共用 /boot/grub/grub.cfg。
+      - name: Add BIOS boot support (dual mode)
+        if: env.BOOT_MODE == 'both'
+        run: |
+          set -euxo pipefail
+          export LIBGUESTFS_BACKEND=direct
+          export LIBGUESTFS_DEBUG=1
+
+          sudo virt-customize -a alpine-base.qcow2 \
+            --install grub,grub-bios,sgdisk \
+            --run-command 'set -eux; sgdisk -e /dev/sda; sgdisk -n 3:0:+4096 -t 3:21686148-6449-6E6F-744E-656564454649 -c 3:BIOS -A 3:set:2 /dev/sda; sgdisk -p /dev/sda' \
+            --run-command 'set -eux; grub-install --target=i386-pc --no-floppy --recheck /dev/sda' \
+            --run-command 'set -eu; sgdisk -p /dev/sda | grep -q EF02 || { echo "断言失败：未找到 bios_grub(EF02) 分区"; exit 1; }; [ -f /boot/grub/grub.cfg ] || { echo "断言失败：缺少 /boot/grub/grub.cfg，BIOS GRUB 无配置可读"; exit 1; }; [ -d /usr/lib/grub/i386-pc ] || { echo "断言失败：缺少 i386-pc 模块"; exit 1; }; S=$(sgdisk -i 3 /dev/sda | awk "/First sector:/ {print \$3}"); [ -n "$S" ] || { echo "断言失败：无法解析分区起始扇区"; exit 1; }; dd if=/dev/sda of=/tmp/sec bs=512 skip=$S count=1 2>/dev/null; dd if=/dev/zero of=/tmp/zero bs=512 count=1 2>/dev/null; if cmp -s /tmp/sec /tmp/zero; then echo "断言失败：bios_grub 分区内容全为 0，GRUB 未写入引导代码"; exit 1; fi; rm -f /tmp/sec /tmp/zero; echo "断言通过：BIOS 引导代码已写入 bios_grub 分区"' \
+            --delete '/var/cache/apk/*'
+
+      - name: Compress image
+        run: |
+          set -euxo pipefail
+          export LIBGUESTFS_BACKEND=direct
+          export LIBGUESTFS_DEBUG=1
+          export LIBGUESTFS_TRACE=1
+
+          if sudo virt-sparsify --compress alpine-base.qcow2 alpine-custom.qcow2; then
+            echo "virt-sparsify 成功"
+          else
+            echo "virt-sparsify 失败，使用 qemu-img convert 兜底"
+            rm -f alpine-custom.qcow2
+            qemu-img convert -O qcow2 -c alpine-base.qcow2 alpine-custom.qcow2
+          fi
+
+          qemu-img info alpine-custom.qcow2
+          ls -lh alpine-custom.qcow2
+
+      - name: Rename image with version and boot label
+        id: rename
+        env:
+          IMAGE_VERSION: ${{ steps.download.outputs.image_version }}
+          BOOT_LABEL: ${{ steps.download.outputs.boot_label }}
+        run: |
+          set -euxo pipefail
+          IMAGE_NAME="alpine-custom-${IMAGE_VERSION}-${BOOT_LABEL}.qcow2"
+          mv -f alpine-custom.qcow2 "${IMAGE_NAME}"
+          ls -lh "${IMAGE_NAME}"
+          echo "image_name=${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpine-custom-qcow2
+          path: alpine-custom-*.qcow2
+          retention-days: 14
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: alpine-custom-qcow2
+          path: dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          IMAGE_VERSION: ${{ needs.build.outputs.image_version }}
+          BOOT_LABEL: ${{ needs.build.outputs.boot_label }}
+          IMAGE_NAME: ${{ needs.build.outputs.image_name }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euxo pipefail
+          ls -lh "dist/${IMAGE_NAME}"
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            BASE_TAG="${GITHUB_REF_NAME}"
+          else
+            BASE_TAG="${INPUT_RELEASE_TAG}"
+            [ -n "${BASE_TAG}" ] || BASE_TAG="manual-${GITHUB_RUN_NUMBER}"
+          fi
+          TAG_NAME="${BASE_TAG}-${BOOT_LABEL}"
+          echo "准备发布 Tag: ${TAG_NAME}（镜像文件 ${IMAGE_NAME}）"
+
+          if ! gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release create "${TAG_NAME}" \
+              --title "Custom Alpine Linux Cloud Image ${TAG_NAME}" \
+              --notes "自动发布的 Alpine Linux 阿里云优化镜像，基于 Alpine ${IMAGE_VERSION}（${BOOT_LABEL} 引导），镜像文件 ${IMAGE_NAME}"
+          fi
+
+          gh release upload "${TAG_NAME}" "dist/${IMAGE_NAME}" --clobber
+
+          gh release edit "${TAG_NAME}" --latest
